@@ -1,0 +1,19 @@
+--- linux-4.14.orig/fs/namespace.c	2020-06-25 13:42:02.000000000 +0000
++++ linux-4.14.186/fs/namespace.c	2026-09-24 14:53:51.683601927 +0000
+@@ -1494,7 +1494,7 @@ static bool disconnect_mount(struct moun
+  * mount_lock must be held
+  * namespace_sem must be held for write
+  */
+-static void umount_tree(struct mount *mnt, enum umount_tree_flags how)
++void umount_tree(struct mount *mnt, enum umount_tree_flags how)
+ {
+ 	LIST_HEAD(tmp_list);
+ 	struct mount *p;
+@@ -1548,6 +1548,7 @@ static void umount_tree(struct mount *mn
+ 		change_mnt_propagation(p, MS_PRIVATE);
+ 	}
+ }
++EXPORT_SYMBOL_GPL(umount_tree);
+ 
+ static void shrink_submounts(struct mount *mnt);
+ 
