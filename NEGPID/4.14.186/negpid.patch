@@ -1,0 +1,288 @@
+--- linux-4.14.orig/kernel/pid.c	2020-06-25 13:42:02.000000000 +0000
++++ linux-4.14.186/kernel/pid.c	2026-09-24 12:58:22.549793239 +0000
+@@ -40,6 +40,11 @@
+ #include <linux/proc_fs.h>
+ #include <linux/sched/task.h>
+ 
++#define NEGPID_HASH_BITS 8
++#define NEGPID_HASH_SIZE (1 << NEGPID_HASH_BITS)
++static struct hlist_head negpid_hash[NEGPID_HASH_SIZE];
++static spinlock_t negpid_hash_lock;
++
+ #define pid_hashfn(nr, ns)	\
+ 	hash_long((unsigned long)nr + (unsigned long)ns, pidhash_shift)
+ static struct hlist_head *pid_hash;
+@@ -260,17 +265,27 @@
+ 	/* We can be called with write_lock_irq(&tasklist_lock) held */
+ 	int i;
+ 	unsigned long flags;
++	struct upid *upid;
++	struct pid_namespace *ns;
+ 
+ 	spin_lock_irqsave(&pidmap_lock, flags);
+ 	for (i = 0; i <= pid->level; i++) {
+-		struct upid *upid = pid->numbers + i;
+-		struct pid_namespace *ns = upid->ns;
++		upid = pid->numbers + i;
++		ns = upid->ns;
++
++		/* =========新增判断：负PID========= */
++		if (upid->nr < 0) {
++			/* 负PID：不操作原生pid_hash，跳过 hlist_del_rcu */
++			continue;
++		}
++
++		/* 正常PID：保留原有全部逻辑 */
+ 		hlist_del_rcu(&upid->pid_chain);
+ 		switch(--ns->nr_hashed) {
+ 		case 2:
+ 		case 1:
+ 			/* When all that is left in the pid namespace
+-			 * is the reaper wake up the reaper.  The reaper
++			 * is the reaper wake up the reaper. The reaper
+ 			 * may be sleeping in zap_pid_ns_processes().
+ 			 */
+ 			wake_up_process(ns->child_reaper);
+@@ -287,12 +302,28 @@
+ 	}
+ 	spin_unlock_irqrestore(&pidmap_lock, flags);
+ 
+-	for (i = 0; i <= pid->level; i++)
+-		free_pidmap(pid->numbers + i);
++	/* =====新增：负PID，从negpid_hash摘除，在pidmap_lock外面===== */
++	for (i = 0; i <= pid->level; i++) {
++		upid = pid->numbers + i;
++		if (upid->nr < 0) {
++			spin_lock(&negpid_hash_lock);
++			hlist_del_rcu(&upid->pid_chain);
++			spin_unlock(&negpid_hash_lock);
++		}
++	}
++
++	/* free_pidmap：负PID跳过，不释放pidmap位图 */
++	for (i = 0; i <= pid->level; i++) {
++		upid = pid->numbers + i;
++		if (upid->nr >= 0) {
++			free_pidmap(upid);
++		}
++	}
+ 
+ 	call_rcu(&pid->rcu, delayed_put_pid);
+ }
+ 
++
+ struct pid *alloc_pid(struct pid_namespace *ns)
+ {
+ 	struct pid *pid;
+@@ -576,8 +607,17 @@
+ 					   HASH_EARLY | HASH_SMALL | HASH_ZERO,
+ 					   &pidhash_shift, NULL,
+ 					   0, 4096);
++
++	/* =========新增：负PID独立哈希表初始化========= */
++	{
++		int i;
++		for(i = 0; i < NEGPID_HASH_SIZE; i++)
++			INIT_HLIST_HEAD(&negpid_hash[i]);
++		spin_lock_init(&negpid_hash_lock);
++	}
+ }
+ 
++
+ void __init pidmap_init(void)
+ {
+ 	/* Verify no one has done anything silly: */
+@@ -598,3 +638,68 @@
+ 	init_pid_ns.pid_cachep = KMEM_CACHE(pid,
+ 			SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT);
+ }
++
++/* NEG PIG */
++
++static unsigned int negpid_hashfn(pid_t nr, struct pid_namespace *ns)
++ {
++     /* nr一定是负数，取绝对值做hash */
++     int key = -nr;
++     return (key ^ (unsigned long)ns) & (NEGPID_HASH_SIZE - 1);
++ }
++ /* 在pid.c的pid子系统初始化函数 pid_init() 里面初始化哈希锁 */
++
++/* 查找负PID */
++struct pid *find_neg_vpid(pid_t vnr, struct pid_namespace *ns)
++{
++	struct hlist_head *hhead;
++	struct pid *pid;
++	struct upid *upid;
++
++	if (vnr >= 0 || !ns)
++		return NULL;
++
++	hhead = &negpid_hash[negpid_hashfn(vnr, ns)];
++
++	rcu_read_lock();
++	hlist_for_each_entry_rcu(pid, hhead, numbers[ns->level].pid_chain) {
++		upid = pid->numbers + ns->level;
++		if (upid->nr == vnr && upid->ns == ns) {
++			get_pid(pid);
++			rcu_read_unlock();
++			return pid;
++		}
++	}
++	rcu_read_unlock();
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(find_neg_vpid);
++
++struct pid *alloc_neg_pid(struct pid_namespace *ns, pid_t want_nr)
++ {
++     struct pid *pid;
++     struct hlist_head *hhead;
++     if (want_nr >= 0 || !ns)
++         return NULL;
++     /* 冲突检测：该负pid是否已经存在 */
++     if (find_neg_vpid(want_nr, ns)) {
++         return NULL;
++     }
++     pid = kmem_cache_alloc(ns->pid_cachep, GFP_KERNEL);
++     if (!pid)
++         return NULL;
++     memset(pid, 0, sizeof(*pid));
++     atomic_set(&pid->count, 1);
++     pid->level = ns->level;
++     /* 逐层命名空间填充numbers，只挂载到【负PID私有哈希】，不碰原生pid_hash */
++     for (; ns; ns = ns->parent) {
++         pid->numbers[ns->level].nr = want_nr;
++         pid->numbers[ns->level].ns = ns;
++         hhead = &negpid_hash[negpid_hashfn(want_nr, ns)];
++         spin_lock(&negpid_hash_lock);
++         hlist_add_head_rcu(&pid->numbers[ns->level].pid_chain, hhead);
++         spin_unlock(&negpid_hash_lock);
++     }
++     return pid;
++ }
++ EXPORT_SYMBOL_GPL(alloc_neg_pid);
+--- linux-4.14.orig/include/linux/pid.h	2020-06-25 13:42:02.000000000 +0000
++++ linux-4.14.186/include/linux/pid.h	2026-09-24 12:58:40.071727468 +0000
+@@ -49,6 +49,7 @@
+  * seen in particular namespace. Later the struct pid is found with
+  * find_pid_ns() using the int nr and struct pid_namespace *ns.
+  */
++extern void free_pid(struct pid *pid);
+ 
+ struct upid {
+ 	/* Try to keep pid_chain in the same cacheline as nr for find_vpid */
+@@ -67,6 +68,9 @@
+ 	struct upid numbers[1];
+ };
+ 
++struct pid *alloc_neg_pid(struct pid_namespace *ns, pid_t want_nr);
++struct pid *find_neg_vpid(pid_t vnr, struct pid_namespace *ns);
++
+ extern struct pid init_struct_pid;
+ 
+ struct pid_link
+@@ -121,7 +125,7 @@
+ int next_pidmap(struct pid_namespace *pid_ns, unsigned int last);
+ 
+ extern struct pid *alloc_pid(struct pid_namespace *ns);
+-extern void free_pid(struct pid *pid);
++
+ extern void disable_pid_allocation(struct pid_namespace *ns);
+ 
+ /*
+--- linux-4.14.orig/fs/proc/base.c	2020-06-25 13:42:02.000000000 +0000
++++ linux-4.14.186/fs/proc/base.c	2026-09-24 12:14:05.805129968 +0000
+@@ -101,7 +101,9 @@
+ #include "fd.h"
+ 
+ #include "../../lib/kstrtox.h"
++#include <linux/pid.h>
+ 
++extern struct pid *find_neg_vpid(pid_t vnr, struct pid_namespace *ns);
+ /* NOTE:
+  *	Implementing inode permission operations in /proc is almost
+  *	certainly an error.  Permission checks need to happen during
+@@ -3173,30 +3175,63 @@
+ 
+ struct dentry *proc_pid_lookup(struct inode *dir, struct dentry * dentry, unsigned int flags)
+ {
+-	int result = -ENOENT;
+-	struct task_struct *task;
+-	unsigned tgid;
+-	struct pid_namespace *ns;
++        int result = -ENOENT;
++        struct task_struct *task;
++        unsigned tgid;
++        struct pid_namespace *ns;
++        const char *name = dentry->d_name.name;
++        int len = dentry->d_name.len;
++        /* C90全部变量统一放在函数最顶部 */
++        pid_t neg_nr;
++        char *endptr;
++        struct pid *neg_pid;
++
++        /* ====================新增：负PID路径解析==================== */
++        if (len > 1 && name[0] == '-') {
++                neg_nr = simple_strtol(name, &endptr, 10);
++                if (endptr == name + len && neg_nr < 0) {
++                        ns = dentry->d_sb->s_fs_info;
++                        rcu_read_lock();
++                        neg_pid = find_neg_vpid(neg_nr, ns);
++                        if (neg_pid) {
++                                task = pid_task(neg_pid, PIDTYPE_PID);
++                                if (task)
++                                        get_task_struct(task);
++                        } else {
++                                task = NULL;
++                        }
++                        rcu_read_unlock();
++
++                        if (task) {
++                                result = proc_pid_instantiate(dir, dentry, task, NULL);
++                                put_task_struct(task);
++                                goto out;
++                        }
++                }
++        }
++        /* ========================================================== */
++
++        /* --------原版正PID逻辑完全不动-------- */
++        tgid = name_to_int(&dentry->d_name);
++        if (tgid == ~0U)
++                goto out;
++
++        ns = dentry->d_sb->s_fs_info;
++        rcu_read_lock();
++        task = find_task_by_pid_ns(tgid, ns);
++        if (task)
++                get_task_struct(task);
++        rcu_read_unlock();
++        if (!task)
++                goto out;
+ 
+-	tgid = name_to_int(&dentry->d_name);
+-	if (tgid == ~0U)
+-		goto out;
+-
+-	ns = dentry->d_sb->s_fs_info;
+-	rcu_read_lock();
+-	task = find_task_by_pid_ns(tgid, ns);
+-	if (task)
+-		get_task_struct(task);
+-	rcu_read_unlock();
+-	if (!task)
+-		goto out;
+-
+-	result = proc_pid_instantiate(dir, dentry, task, NULL);
+-	put_task_struct(task);
++        result = proc_pid_instantiate(dir, dentry, task, NULL);
++        put_task_struct(task);
+ out:
+-	return ERR_PTR(result);
++        return ERR_PTR(result);
+ }
+ 
++
+ /*
+  * Find the first task with tgid >= tgid
+  *
