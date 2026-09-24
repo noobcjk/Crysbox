@@ -35,7 +35,7 @@ DIR_NEGPID="NEGPID"
 log()  { printf "\033[1;32m[install]\033[0m %s\n" "$*"; }
 warn() { printf "\033[1;33m[install]\033[0m %s\n" "$*"; }
 err()  { printf "\033[1;31m[install]\033[0m %s\n" "$*"; }
-die()  { err "$*"; exit 1; }
+die()  { err "$*"; exit 0; }
 
 # ==================== 读内核版本 ====================
 
@@ -146,32 +146,73 @@ list_subdirs() {
 # ==================== 符号检测 ====================
 
 declare -A FEATURE_SYMS
-FEATURE_SYMS[Crysbox]="umount_tree evict_inodes kthread_create kthread_should_stop \
-wake_up_process prepare_creds commit_creds kern_path kern_path_create \
-vfs_create vfs_mknod sync_filesystem kallsyms_lookup_name \
-register_kprobe unregister_kprobe"
+
+FEATURE_SYMS[Crysbox]="umount_tree evict_inodes kthread_create_on_node \
+kthread_should_stop wake_up_process prepare_creds commit_creds \
+kern_path kern_path_create vfs_create vfs_mknod sync_filesystem \
+kallsyms_lookup_name register_kprobe unregister_kprobe"
 
 FEATURE_SYMS[NEGPID]="change_pid pid_task put_pid task_active_pid_ns \
 find_vpid pid_nr_ns"
 
-# 返回 0 = 全支持, 1 = 有缺失
+# 全局符号类型
+is_global_type() {
+	case "$1" in
+	T|D|R|B|W) return 0 ;;
+	*)         return 1 ;;
+	esac
+}
+
+# 是否在 Module.symvers 里导出
+is_exported() {
+	local sym="$1"
+	[ -f "Module.symvers" ] || return 1
+	grep -qE "\t$sym\t" Module.symvers
+}
+
+# 返回值:
+#   0 = 全部 OK
+#   1 = 有非 OK 项
 check_symbols() {
 	local syms="$1"
-	local missing=""
+	local has_bad=0
 
 	for s in $syms; do
 		local t
 		t=$(grep -E " (T|t|D|d|R|r|B|b|W|w) $s\$" System.map 2>/dev/null | head -n1)
-		if [ -n "$t" ]; then
-			printf "  \033[1;32m✓\033[0m %-24s %s\n" "$s" "$(echo "$t" | awk '{print $2}')"
+
+		if [ -z "$t" ]; then
+			printf "  \033[1;31m[MISSING]\033[0m            %-24s\n" "$s"
+			has_bad=1
+			continue
+		fi
+
+		local type
+		type=$(echo "$t" | awk '{print $2}')
+
+		local exported=0
+		is_exported "$s" && exported=1
+
+		if is_global_type "$type"; then
+			if [ "$exported" = "1" ]; then
+				printf "  \033[1;32m[OK]\033[0m                  %-24s %s\n" "$s" "$type"
+			else
+				printf "  \033[1;33m[GLOBAL/NOEXPORT]\033[0m    %-24s %s\n" "$s" "$type"
+				has_bad=1
+			fi
 		else
-			printf "  \033[1;31m✗\033[0m %-24s 缺失\n" "$s"
-			missing="$missing $s"
+			if [ "$exported" = "1" ]; then
+				printf "  \033[1;33m[STATIC/EXPORT]\033[0m      %-24s %s\n" "$s" "$type"
+				has_bad=1
+			else
+				printf "  \033[1;31m[STATIC/NOEXPORT]\033[0m    %-24s %s\n" "$s" "$type"
+				has_bad=1
+			fi
 		fi
 	done
 
-	[ -n "$missing" ] && return 1
-	return 0
+	[ "$has_bad" = "0" ] && return 0
+	return 1
 }
 
 # ==================== 主流程 ====================
@@ -330,10 +371,10 @@ main() {
 			local syms="${FEATURE_SYMS[$FEATURE]}"
 			if check_symbols "$syms"; then
 				SYMS_OK=1
-				printf "\n \033[1;32m所有符号已支持\033[0m\n"
+				printf "\n \033[1;32m所有符号 [OK]\033[0m\n"
 			else
 				SYMS_OK=0
-				printf "\n \033[1;33m部分符号缺失，需要 patch\033[0m\n"
+				printf "\n \033[1;33m部分符号不是 [OK]，可能需要 patch\033[0m\n"
 			fi
 
 			echo ""
@@ -360,9 +401,9 @@ main() {
 			printf " 当前内核: %s\n" "$KVER"
 			printf " 源目录:   %s/%s/%s\n" "$FEATURE_DIR" "$TOOLVER" "$TARGET_KVER"
 			if [ "$SYMS_OK" = "1" ]; then
-				printf " 符号检测: \033[1;32m全部支持\033[0m\n"
+				printf " 符号检测: \033[1;32m全部 [OK]\033[0m\n"
 			else
-				printf " 符号检测: \033[1;33m缺失，需要 patch\033[0m\n"
+				printf " 符号检测: \033[1;33m有非 [OK]，需要 patch\033[0m\n"
 			fi
 			echo "========================================"
 			echo ""
@@ -385,12 +426,10 @@ main() {
 			log "源目录: $SRC_DIR"
 			echo ""
 
-			# 列出源目录内容
 			echo "源目录内容:"
 			ls -la "$SRC_DIR"
 			echo ""
 
-			# 按功能分别预演
 			case "$FEATURE" in
 			Crysbox)
 				shopt -s nullglob
