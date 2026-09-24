@@ -164,10 +164,11 @@ is_global_type() {
 }
 
 # 是否在 Module.symvers 里导出
+# 用 awk 按空白分隔，$2 是符号名，tab/空格都行
 is_exported() {
 	local sym="$1"
 	[ -f "Module.symvers" ] || return 1
-	grep -qE "\t$sym\t" Module.symvers
+	awk -v s="$sym" '$2 == s {found=1; exit} END {exit !found}' Module.symvers
 }
 
 # 返回值:
