@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# install.sh - crysbox / negpid 安装预演
+# install.sh - crysbox / negpid 安装
 #
 # 流程:
 #   1. 判断内核目录
@@ -8,12 +8,18 @@
 #   3. git clone / pull -> /tmp/Crysbox
 #   4. 判断是否受支持
 #   5. 判断是否已安装
-#   6. 选功能
-#   7. 选工具版本
-#   8. 选内核版本
-#   9. 符号检测
-#  10. 摘要
-#  11. 预演 (proceed)
+#   6. 打 export-symbols patch (打完退出, 需重新 make)
+#   7. 选功能
+#   8. 选工具版本
+#   9. 选内核版本
+#  10. 符号检测
+#  11. 摘要
+#  12. 执行 (proceed) - 拷贝源码 / 改 Makefile / 打 patch
+#
+# 路径约定:
+#   Crysbox.c -> fs/crysbox.c
+#   fs/Makefile 追加 obj-y += crysbox.o
+#   NEGPID patch -> patch -p1
 #
 
 set -u
@@ -29,6 +35,10 @@ INSTALL_RECORD="${INSTALL_RECORD:-$HOME/.crysbox-installed}"
 
 DIR_BOX="Crysbox"
 DIR_NEGPID="NEGPID"
+DIR_EXPORT="export-symbols"
+
+BOX_TARGET_DIR="fs"
+BOX_MAKEFILE="fs/Makefile"
 
 # ==================== 输出 ====================
 
@@ -95,23 +105,21 @@ list_installed_for_kernel() {
 	awk -v k="$kver" '$3 == k {print $1, $2, $3}' "$INSTALL_RECORD"
 }
 
+record_install() {
+	local feat="$1" tool="$2" kver="$3"
+	mkdir -p "$(dirname "$INSTALL_RECORD")"
+	echo "$feat $tool $kver" >> "$INSTALL_RECORD"
+}
+
 # ==================== 选择器 ====================
 
 PICK_RESULT=""
-# 返回值:
-#   0 = 选中, PICK_RESULT 有效
-#   1 = 输入非法
-#   2 = 返回上一层
-#   3 = 退出
-#   4 = 列表为空
 pick_menu() {
 	local prompt="$1"
 	shift
 	local arr=("$@")
 
-	if [ ${#arr[@]} -eq 0 ]; then
-		return 4
-	fi
+	[ ${#arr[@]} -eq 0 ] && return 4
 
 	echo "$prompt"
 	local i=1
@@ -155,7 +163,6 @@ kallsyms_lookup_name register_kprobe unregister_kprobe"
 FEATURE_SYMS[NEGPID]="change_pid pid_task put_pid task_active_pid_ns \
 find_vpid pid_nr_ns"
 
-# 全局符号类型
 is_global_type() {
 	case "$1" in
 	T|D|R|B|W) return 0 ;;
@@ -163,17 +170,12 @@ is_global_type() {
 	esac
 }
 
-# 是否在 Module.symvers 里导出
-# 用 awk 按空白分隔，$2 是符号名，tab/空格都行
 is_exported() {
 	local sym="$1"
 	[ -f "Module.symvers" ] || return 1
 	awk -v s="$sym" '$2 == s {found=1; exit} END {exit !found}' Module.symvers
 }
 
-# 返回值:
-#   0 = 全部 OK
-#   1 = 有非 OK 项
 check_symbols() {
 	local syms="$1"
 	local has_bad=0
@@ -216,23 +218,63 @@ check_symbols() {
 	return 1
 }
 
+# ==================== export-symbols patch ====================
+
+apply_export_patches() {
+	local kver="$1"
+	local edir="$PROJECT_ROOT/$DIR_EXPORT/$kver"
+
+	[ -d "$edir" ] || return 0
+
+	shopt -s nullglob
+	local patches=("$edir"/*.patch)
+	shopt -u nullglob
+
+	[ ${#patches[@]} -eq 0 ] && return 0
+
+	for p in "${patches[@]}"; do
+		log "应用 export-symbols: $(basename "$p")"
+
+		if patch -p1 --forward --dry-run < "$p" >/dev/null 2>&1; then
+			patch -p1 --forward < "$p" || {
+				err "patch 失败: $p"
+				return 1
+			}
+		else
+			warn "patch 已打过或冲突，跳过: $(basename "$p")"
+		fi
+	done
+
+	return 0
+}
+
+# ==================== 备份 ====================
+
+backup_file() {
+	local f="$1"
+	[ -f "$f" ] || return 0
+	local dst="$BACKUP_DIR/$KVER/$f"
+	mkdir -p "$(dirname "$dst")"
+	cp -v "$f" "$dst"
+}
+
 # ==================== 主流程 ====================
 
 main() {
 	KERNEL_DIR="$(pwd)"
 
 	echo "========================================"
-	echo "  crysbox / negpid 安装预演"
+	echo "  crysbox / negpid 安装"
 	echo "========================================"
 	echo ""
 
-	# ---------- 1. 判断内核目录 ----------
+	# 1. 内核目录
 	if [ ! -f "Makefile" ] || [ ! -d "fs/proc" ] || [ ! -f "kernel/pid.c" ]; then
 		die "当前目录不是内核源码目录: $KERNEL_DIR"
 	fi
 	log "内核源码目录: $KERNEL_DIR"
 
-	# ---------- 2. 读版本 ----------
+	# 2. 读版本
 	KVER=$(read_kernel_version)
 	[ -n "$KVER" ] || die "无法读取内核版本"
 
@@ -242,11 +284,11 @@ main() {
 		BUILT="未构建"
 	fi
 
-	# ---------- 3. 拉项目 ----------
+	# 3. 拉项目
 	fetch_project
 	echo ""
 
-	# ---------- 4. 判断是否受支持 ----------
+	# 4. 判断受支持
 	local SUPPORTED_KERNELS
 	SUPPORTED_KERNELS=$(list_supported_kernels)
 	SUPPORTED=0
@@ -291,7 +333,7 @@ main() {
 		echo ""
 	fi
 
-	# ---------- 5. 判断是否安装过 ----------
+	# 5. 判断已安装
 	local installed
 	installed=$(list_installed_for_kernel "$KVER")
 	if [ -n "$installed" ]; then
@@ -309,6 +351,35 @@ main() {
 		echo ""
 	fi
 
+	# 6. export-symbols
+	local edir="$PROJECT_ROOT/$DIR_EXPORT/$KVER"
+	if [ -d "$edir" ]; then
+		shopt -s nullglob
+		local epatches=("$edir"/*.patch)
+		shopt -u nullglob
+
+		if [ ${#epatches[@]} -gt 0 ]; then
+			echo "========================================"
+			echo " export-symbols patch"
+			echo "========================================"
+			for p in "${epatches[@]}"; do
+				printf "  %s\n" "$(basename "$p")"
+			done
+			echo ""
+			echo -n "是否应用? [y/N]: "
+			read -r ans
+			case "$ans" in
+			y|Y)
+				apply_export_patches "$KVER" || die "export patch 失败"
+				warn "export patch 已打，请重新 make 后再跑本脚本"
+				exit 0
+				;;
+			*)  log "跳过" ;;
+			esac
+			echo ""
+		fi
+	fi
+
 	# ==================== 状态机 ====================
 	local STATE="feature"
 	local RET=0
@@ -318,7 +389,6 @@ main() {
 	while true; do
 		case "$STATE" in
 
-		# ==================== 选功能 ====================
 		feature)
 			pick_menu "请选择功能:" "Crysbox" "NEGPID"
 			RET=$?
@@ -327,16 +397,11 @@ main() {
 			    FEATURE_DIR="$PROJECT_ROOT/$FEATURE"
 			    STATE="toolver"
 			    ;;
-			2)  # 最顶层，没有上一层 → 退出
-			    log "已取消"
-			    exit 0
-			    ;;
-			3)  log "已取消"; exit 0 ;;
-			*)  ;; # 1/4 非法/空，重试
+			2|3) log "已取消"; exit 0 ;;
+			*)  ;;
 			esac
 			;;
 
-		# ==================== 选工具版本 ====================
 		toolver)
 			mapfile -t TOOL_VERSIONS < <(list_subdirs "$FEATURE_DIR")
 			pick_menu "请选择工具版本:" "${TOOL_VERSIONS[@]}"
@@ -349,7 +414,6 @@ main() {
 			esac
 			;;
 
-		# ==================== 选内核版本 ====================
 		kver)
 			mapfile -t KERNEL_VERSIONS < <(list_subdirs "$FEATURE_DIR/$TOOLVER")
 			pick_menu "请选择内核版本:" "${KERNEL_VERSIONS[@]}"
@@ -362,7 +426,6 @@ main() {
 			esac
 			;;
 
-		# ==================== 符号检测 ====================
 		syms)
 			echo ""
 			echo "========================================"
@@ -392,7 +455,6 @@ main() {
 			esac
 			;;
 
-		# ==================== 摘要 ====================
 		summary)
 			echo ""
 			echo "========================================"
@@ -421,14 +483,10 @@ main() {
 			esac
 			;;
 
-		# ==================== 预演 ====================
+		# ==================== 执行 ====================
 		proceed)
 			local SRC_DIR="$FEATURE_DIR/$TOOLVER/$TARGET_KVER"
 			log "源目录: $SRC_DIR"
-			echo ""
-
-			echo "源目录内容:"
-			ls -la "$SRC_DIR"
 			echo ""
 
 			case "$FEATURE" in
@@ -438,33 +496,35 @@ main() {
 				shopt -u nullglob
 
 				if [ ${#cfiles[@]} -eq 0 ]; then
-					warn "源目录没有 .c 文件"
-				else
-					echo "会拷贝到 fs/proc/:"
-					for c in "${cfiles[@]}"; do
-						local base
-						base=$(basename "$c")
-						printf "  %s -> fs/proc/%s\n" "$base" "$base"
-						if [ -f "fs/proc/$base" ]; then
-							printf "    覆盖前备份 -> %s/%s/fs/proc/%s\n" \
-								"$BACKUP_DIR" "$KVER" "$base"
-						fi
-					done
-					echo ""
-
-					echo "会改 fs/proc/Makefile:"
-					for c in "${cfiles[@]}"; do
-						local obj
-						obj="$(basename "$c" .c).o"
-						if grep -qE "obj-\\\$\(CONFIG_PROC_FS\)[[:space:]]*\+=[[:space:]].*\\b$obj\\b" fs/proc/Makefile; then
-							printf "  %s 已存在，跳过\n" "$obj"
-						else
-							printf "  追加 obj-\$(CONFIG_PROC_FS) += %s\n" "$obj"
-							printf "    备份 -> %s/%s/fs/proc/Makefile\n" \
-								"$BACKUP_DIR" "$KVER"
-						fi
-					done
+					err "源目录没有 .c 文件"
+					STATE="done"
+					continue
 				fi
+
+				local changed_makefile=0
+
+				for c in "${cfiles[@]}"; do
+					local base
+					base=$(basename "$c")
+					local dst="$BOX_TARGET_DIR/$base"
+
+					backup_file "$dst"
+					cp -v "$c" "$dst"
+					log "拷贝 $base -> $dst"
+
+					local obj
+					obj="$(basename "$c" .c).o"
+					if grep -qE "^obj-y[[:space:]]*\+=[[:space:]].*\\b$obj\\b" "$BOX_MAKEFILE"; then
+						log "$BOX_MAKEFILE 已含 $obj，跳过"
+					else
+						if [ "$changed_makefile" = "0" ]; then
+							backup_file "$BOX_MAKEFILE"
+							changed_makefile=1
+						fi
+						echo "obj-y += $obj" >> "$BOX_MAKEFILE"
+						log "追加 obj-y += $obj 到 $BOX_MAKEFILE"
+					fi
+				done
 				;;
 
 			NEGPID)
@@ -473,46 +533,56 @@ main() {
 				shopt -u nullglob
 
 				if [ ${#patches[@]} -eq 0 ]; then
-					warn "源目录没有 .patch 文件"
-				else
-					for p in "${patches[@]}"; do
-						echo "patch: $(basename "$p")"
-
-						local prefix="-p1"
-						head -n1 "$p" | grep -q '^--- a/' && prefix="-p1"
-						printf "  使用 %s\n" "$prefix"
-
-						echo "  影响文件:"
-						grep -E '^\+\+\+ ' "$p" | sed 's|^+++ b/||;s|^+++ ||' | while read -r f; do
-							local status="不存在"
-							[ -f "$f" ] && status="存在"
-							printf "    %s (%s)\n" "$f" "$status"
-							printf "      备份 -> %s/%s/%s\n" "$BACKUP_DIR" "$KVER" "$f"
-						done
-
-						if patch -p1 --forward --dry-run < "$p" >/dev/null 2>&1; then
-							printf "  dry-run: 可以应用\n"
-						else
-							printf "  dry-run: 失败（可能已打过或冲突）\n"
-						fi
-					done
+					err "源目录没有 .patch 文件"
+					STATE="done"
+					continue
 				fi
+
+				for p in "${patches[@]}"; do
+					log "应用 patch: $(basename "$p")"
+
+					grep -E '^\+\+\+ ' "$p" | sed 's|^+++ b/||;s|^+++ ||' | while read -r f; do
+						backup_file "$f"
+					done
+
+					local prefix="-p1"
+					if ! head -n1 "$p" | grep -q '^--- a/'; then
+						prefix="-p0"
+					fi
+
+					if patch $prefix --forward --dry-run < "$p" >/dev/null 2>&1; then
+						patch $prefix --forward < "$p" || {
+							err "patch 失败: $p"
+							STATE="done"
+							continue 2
+						}
+						log "patch 应用成功: $(basename "$p")"
+					else
+						warn "patch 已打过或冲突: $(basename "$p")"
+						warn "尝试 --fuzz=3 强打"
+						patch $prefix --forward --fuzz=3 < "$p" || {
+							err "patch 强打失败: $p"
+							STATE="done"
+							continue 2
+						}
+					fi
+				done
 				;;
 			esac
 
 			echo ""
-			log "========== 预演结束（未修改任何文件）=========="
+			record_install "$FEATURE" "$TOOLVER" "$TARGET_KVER"
+			log "已记录到 $INSTALL_RECORD"
 			log "备份目录: $BACKUP_DIR/$KVER/"
-			log "安装记录: $INSTALL_RECORD"
+			log "========== 执行完成 =========="
+			log "请重新 make 验证"
 			STATE="done"
 			;;
 
-		# ==================== 结束 ====================
 		done)
 			break
 			;;
 
-		# ==================== 退出 ====================
 		quit|*)
 			log "已取消"
 			exit 0
