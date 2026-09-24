@@ -5,21 +5,19 @@
 # 流程:
 #   1. 判断内核目录
 #   2. 读当前内核版本
-#   3. git clone / pull -> /tmp/Crysbox
-#   4. 判断是否受支持
-#   5. 判断是否已安装
-#   6. 打 export-symbols patch (打完退出, 需重新 make)
+#   3. 判断是否 make 过
+#   4. git clone / pull -> /tmp/Crysbox
+#   5. 判断是否受支持
+#   6. 判断是否已安装
 #   7. 选功能
 #   8. 选工具版本
 #   9. 选内核版本
 #  10. 符号检测
+#      - 有 STATIC/NOEXPORT 或 MISSING -> 拒绝
+#      - 有 GLOBAL/NOEXPORT 或 STATIC/EXPORT -> 允许
+#      - 全 OK -> 允许
 #  11. 摘要
-#  12. 执行 (proceed) - 拷贝源码 / 改 Makefile / 打 patch
-#
-# 路径约定:
-#   Crysbox.c -> fs/crysbox.c
-#   fs/Makefile 追加 obj-y += crysbox.o
-#   NEGPID patch -> patch -p1
+#  12. 执行
 #
 
 set -u
@@ -176,9 +174,17 @@ is_exported() {
 	awk -v s="$sym" '$2 == s {found=1; exit} END {exit !found}' Module.symvers
 }
 
+# 返回值:
+#   0 = 全部 OK 或允许 (GLOBAL/NOEXPORT, STATIC/EXPORT)
+#   1 = 有 STATIC/NOEXPORT 或 MISSING (拒绝)
+# 输出: 打印每个符号的状态, 设置全局 HAS_BAD, BAD_LIST
+HAS_BAD=0
+BAD_LIST=""
+
 check_symbols() {
 	local syms="$1"
-	local has_bad=0
+	HAS_BAD=0
+	BAD_LIST=""
 
 	for s in $syms; do
 		local t
@@ -186,7 +192,8 @@ check_symbols() {
 
 		if [ -z "$t" ]; then
 			printf "  \033[1;31m[MISSING]\033[0m            %-24s\n" "$s"
-			has_bad=1
+			HAS_BAD=1
+			BAD_LIST="$BAD_LIST $s"
 			continue
 		fi
 
@@ -201,51 +208,20 @@ check_symbols() {
 				printf "  \033[1;32m[OK]\033[0m                  %-24s %s\n" "$s" "$type"
 			else
 				printf "  \033[1;33m[GLOBAL/NOEXPORT]\033[0m    %-24s %s\n" "$s" "$type"
-				has_bad=1
 			fi
 		else
 			if [ "$exported" = "1" ]; then
 				printf "  \033[1;33m[STATIC/EXPORT]\033[0m      %-24s %s\n" "$s" "$type"
-				has_bad=1
 			else
 				printf "  \033[1;31m[STATIC/NOEXPORT]\033[0m    %-24s %s\n" "$s" "$type"
-				has_bad=1
+				HAS_BAD=1
+				BAD_LIST="$BAD_LIST $s"
 			fi
 		fi
 	done
 
-	[ "$has_bad" = "0" ] && return 0
+	[ "$HAS_BAD" = "0" ] && return 0
 	return 1
-}
-
-# ==================== export-symbols patch ====================
-
-apply_export_patches() {
-	local kver="$1"
-	local edir="$PROJECT_ROOT/$DIR_EXPORT/$kver"
-
-	[ -d "$edir" ] || return 0
-
-	shopt -s nullglob
-	local patches=("$edir"/*.patch)
-	shopt -u nullglob
-
-	[ ${#patches[@]} -eq 0 ] && return 0
-
-	for p in "${patches[@]}"; do
-		log "应用 export-symbols: $(basename "$p")"
-
-		if patch -p1 --forward --dry-run < "$p" >/dev/null 2>&1; then
-			patch -p1 --forward < "$p" || {
-				err "patch 失败: $p"
-				return 1
-			}
-		else
-			warn "patch 已打过或冲突，跳过: $(basename "$p")"
-		fi
-	done
-
-	return 0
 }
 
 # ==================== 备份 ====================
@@ -278,17 +254,19 @@ main() {
 	KVER=$(read_kernel_version)
 	[ -n "$KVER" ] || die "无法读取内核版本"
 
-	if [ -f "vmlinux" ] && [ -f "System.map" ]; then
-		BUILT="已构建"
-	else
-		BUILT="未构建"
+	# 3. 判断 make 过
+	if [ ! -f "vmlinux" ] || [ ! -f "System.map" ]; then
+		err "内核未构建 (缺 vmlinux / System.map)"
+		err "请先 make -j\$(nproc) 再跑本脚本"
+		exit 0
 	fi
+	log "内核已构建: $KVER"
 
-	# 3. 拉项目
+	# 4. 拉项目
 	fetch_project
 	echo ""
 
-	# 4. 判断受支持
+	# 5. 判断受支持
 	local SUPPORTED_KERNELS
 	SUPPORTED_KERNELS=$(list_supported_kernels)
 	SUPPORTED=0
@@ -305,7 +283,6 @@ main() {
 	else
 		printf " 当前版本: %s  | \033[1;31m不受支持\033[0m\n" "$KVER"
 	fi
-	echo " 内核状态: $BUILT"
 	echo " 项目目录: $PROJECT_ROOT"
 	if [ -n "$SUPPORTED_KERNELS" ]; then
 		echo " 支持的版本:"
@@ -333,7 +310,7 @@ main() {
 		echo ""
 	fi
 
-	# 5. 判断已安装
+	# 6. 判断已安装
 	local installed
 	installed=$(list_installed_for_kernel "$KVER")
 	if [ -n "$installed" ]; then
@@ -351,40 +328,10 @@ main() {
 		echo ""
 	fi
 
-	# 6. export-symbols
-	local edir="$PROJECT_ROOT/$DIR_EXPORT/$KVER"
-	if [ -d "$edir" ]; then
-		shopt -s nullglob
-		local epatches=("$edir"/*.patch)
-		shopt -u nullglob
-
-		if [ ${#epatches[@]} -gt 0 ]; then
-			echo "========================================"
-			echo " export-symbols patch"
-			echo "========================================"
-			for p in "${epatches[@]}"; do
-				printf "  %s\n" "$(basename "$p")"
-			done
-			echo ""
-			echo -n "是否应用? [y/N]: "
-			read -r ans
-			case "$ans" in
-			y|Y)
-				apply_export_patches "$KVER" || die "export patch 失败"
-				warn "export patch 已打，请重新 make 后再跑本脚本"
-				exit 0
-				;;
-			*)  log "跳过" ;;
-			esac
-			echo ""
-		fi
-	fi
-
 	# ==================== 状态机 ====================
 	local STATE="feature"
 	local RET=0
 	local FEATURE="" FEATURE_DIR="" TOOLVER="" TARGET_KVER=""
-	local SYMS_OK=0
 
 	while true; do
 		case "$STATE" in
@@ -433,26 +380,54 @@ main() {
 			echo "========================================"
 
 			local syms="${FEATURE_SYMS[$FEATURE]}"
-			if check_symbols "$syms"; then
-				SYMS_OK=1
-				printf "\n \033[1;32m所有符号 [OK]\033[0m\n"
-			else
-				SYMS_OK=0
-				printf "\n \033[1;33m部分符号不是 [OK]，可能需要 patch\033[0m\n"
-			fi
+			check_symbols "$syms"
 
-			echo ""
-			echo "  1) 继续"
-			echo "  0) 返回上一层"
-			echo "  q) 退出"
-			echo -n "请选择 [1/0/q]: "
-			read -r sel
-			case "$sel" in
-			1)  STATE="summary" ;;
-			0)  STATE="kver" ;;
-			q|Q) log "已取消"; exit 0 ;;
-			*)  ;;
-			esac
+			if [ "$HAS_BAD" = "0" ]; then
+				printf "\n \033[1;32m符号检测通过\033[0m\n"
+				echo ""
+				echo "  1) 继续"
+				echo "  0) 返回上一层"
+				echo "  q) 退出"
+				echo -n "请选择 [1/0/q]: "
+				read -r sel
+				case "$sel" in
+				1)  STATE="summary" ;;
+				0)  STATE="kver" ;;
+				q|Q) log "已取消"; exit 0 ;;
+				*)  ;;
+				esac
+			else
+				printf "\n \033[1;31m符号检测未通过\033[0m\n"
+				echo ""
+				warn "以下符号是 static 且未导出，或缺失:"
+				for s in $BAD_LIST; do
+					printf "  - %s\n" "$s"
+				done
+				echo ""
+				warn "请到 $PROJECT_ROOT/$DIR_EXPORT/$KVER/ 手动应用 patch:"
+				shopt -s nullglob
+				local epatches=("$PROJECT_ROOT/$DIR_EXPORT/$KVER"/*.patch)
+				shopt -u nullglob
+				if [ ${#epatches[@]} -gt 0 ]; then
+					for p in "${epatches[@]}"; do
+						printf "  patch -p1 < %s\n" "$p"
+					done
+				else
+					printf "  (目录下无 patch，请自行处理)\n"
+				fi
+				echo ""
+				printf "  打完后 make -j\$(nproc) 重新编译，再跑本脚本\n"
+				echo ""
+				echo "  0) 返回上一层"
+				echo "  q) 退出"
+				echo -n "请选择 [0/q]: "
+				read -r sel
+				case "$sel" in
+				0)  STATE="kver" ;;
+				q|Q) log "已取消"; exit 0 ;;
+				*)  ;;
+				esac
+			fi
 			;;
 
 		summary)
@@ -463,11 +438,7 @@ main() {
 			printf " 目标内核: %s\n" "$TARGET_KVER"
 			printf " 当前内核: %s\n" "$KVER"
 			printf " 源目录:   %s/%s/%s\n" "$FEATURE_DIR" "$TOOLVER" "$TARGET_KVER"
-			if [ "$SYMS_OK" = "1" ]; then
-				printf " 符号检测: \033[1;32m全部 [OK]\033[0m\n"
-			else
-				printf " 符号检测: \033[1;33m有非 [OK]，需要 patch\033[0m\n"
-			fi
+			printf " 符号检测: \033[1;32m通过\033[0m\n"
 			echo "========================================"
 			echo ""
 			echo "  1) 继续"
